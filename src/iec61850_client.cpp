@@ -936,8 +936,19 @@ IEC61850Client::processBooleanType (
     MmsVariableSpecification* varSpec, Quality quality, uint64_t timestamp,
     const std::string& attribute, const char* elementName)
 {
+    /* Some CDCs (e.g. ACD/ACT "Str"/"Op" DOs) carry their boolean under a
+     * name other than the CDC-generic default (e.g. "general", or a
+     * per-phase "phsA"/"phsB"/"phsC"), which the config's own objRef DA
+     * suffix already names via `attribute`. Try that first; only fall
+     * back to the CDC-generic elementName (and then the bare-mmsvalue
+     * case) for objRefs that don't specify a more precise attribute. */
     MmsValue const* element
-        = MmsValue_getSubElement (mmsvalue, varSpec, (char*)elementName);
+        = (!attribute.empty () && attribute != elementName)
+              ? MmsValue_getSubElement (mmsvalue, varSpec,
+                                        (char*)attribute.c_str ())
+              : nullptr;
+    if (!element)
+        element = MmsValue_getSubElement (mmsvalue, varSpec, (char*)elementName);
     if (!element)
     {
         if (attribute == elementName)
