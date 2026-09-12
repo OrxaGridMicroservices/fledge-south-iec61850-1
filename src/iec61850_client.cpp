@@ -692,7 +692,6 @@ IEC61850Client::handleAllValues ()
 
         CDCTYPE typeId = def->cdcType;
 
-        labels.push_back (def->label);
         FunctionalConstraint fc = def->cdcType == MV || def->cdcType == APC
                                       ? IEC61850_FC_MX
                                       : IEC61850_FC_ST;
@@ -719,8 +718,21 @@ IEC61850Client::handleAllValues ()
             }
         }
 
+        /* sendData() below pairs labels[i] with datapoints[i] strictly by
+         * position. m_handleMonitoringData only appends to `datapoints` on
+         * success (e.g. it does nothing when the named attribute isn't
+         * found) - pushing this point's label unconditionally, before
+         * knowing whether it succeeded, desyncs the two vectors' indices
+         * on the very first failure, silently mislabeling every point
+         * polled afterwards for the rest of this cycle. Only record the
+         * label once we know a datapoint was actually added for it. */
+        size_t datapointsBefore = datapoints.size ();
         m_handleMonitoringData (doRef, datapoints, def->label, typeId,
                                 nullptr, attribute, fc, 0);
+        if (datapoints.size () > datapointsBefore)
+        {
+            labels.push_back (def->label);
+        }
     }
     sendData (datapoints, labels);
 }
@@ -781,8 +793,29 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
 
     labels.push_back (def->label);
 
-    m_handleMonitoringData (def->objRef, datapoints, def->label, typeId,
-                            mmsValue, extracted, fcValue, timestamp);
+    /* `extracted` above is derived from the *incoming report's own* FCDA
+     * reference, which for a DO-level dataset entry (e.g. "LD/LN.DO[ST]",
+     * one dot) has no further DA component and comes out empty - even when
+     * def->objRef (the config's own, authoritative reference) names a more
+     * precise attribute, e.g. "LD/LN.DO.general" or "LD/LN.DO.mag.f". Prefer
+     * that when present, using the same DO-level truncation the polling
+     * path (handleAllValues) already applies to def->objRef, so both paths
+     * resolve the same attribute for the same configured point. */
+    std::string doRef = def->objRef;
+    std::string attribute = extracted;
+    size_t defFirstDot = doRef.find ('.');
+    if (defFirstDot != std::string::npos)
+    {
+        size_t defSecondDot = doRef.find ('.', defFirstDot + 1);
+        if (defSecondDot != std::string::npos)
+        {
+            attribute = doRef.substr (defSecondDot + 1);
+            doRef.erase (defSecondDot);
+        }
+    }
+
+    m_handleMonitoringData (doRef, datapoints, def->label, typeId,
+                            mmsValue, attribute, fcValue, timestamp);
 
     /* datapoints stays empty when value-processing fails (e.g. the DA
      * named by `attribute` isn't found in the struct read back) -
