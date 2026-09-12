@@ -286,11 +286,18 @@ IEC61850ClientConfig::importProtocolConfig (const std::string& protocolConfig)
                             '.', extractedObjRef.find ('.') + 1);
                         size_t bracketPos = extractedObjRef.find ('[');
 
+                        /* A DO-level entry (e.g. "LD/LN.DO", no DA suffix
+                         * and no "[FC]" suffix) has neither a second dot nor
+                         * a bracket. erase() with an npos position throws
+                         * std::out_of_range, which previously escaped
+                         * uncaught and aborted plugin load entirely. Such an
+                         * entry is already at DO level, so there's simply
+                         * nothing to truncate. */
                         if (secondDotPos != std::string::npos)
                         {
                             extractedObjRef.erase (secondDotPos);
                         }
-                        else
+                        else if (bracketPos != std::string::npos)
                         {
                             extractedObjRef.erase (bracketPos);
                         }
