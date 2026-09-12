@@ -524,8 +524,26 @@ IEC61850ClientConnection::m_setVarSpecs ()
         FunctionalConstraint fc = def->cdcType == MV || def->cdcType == APC
                                       ? IEC61850_FC_MX
                                       : IEC61850_FC_ST;
+
+        /* def->objRef includes the DA suffix (e.g. "...GGIO1.Ind001.stVal"),
+         * but the runtime read (handleValue) always reads at the DO level
+         * ("...GGIO1.Ind001"), returning a struct with stVal/q/t sub-
+         * elements. Fetching the spec against the full DA-suffixed path
+         * instead describes the scalar leaf, so every later
+         * MmsValue_getSubElement(mmsvalue, spec, "stVal"/"mag") lookup
+         * fails with "No stVal/mag found" even though the value read
+         * itself succeeds. Truncate to the DO level here to match. */
+        std::string doRef = def->objRef;
+        size_t firstDot = doRef.find ('.');
+        if (firstDot != std::string::npos)
+        {
+            size_t secondDot = doRef.find ('.', firstDot + 1);
+            if (secondDot != std::string::npos)
+                doRef.erase (secondDot);
+        }
+
         MmsVariableSpecification* spec
-            = getVariableSpec (&err, def->objRef.c_str (), fc);
+            = getVariableSpec (&err, doRef.c_str (), fc);
         if (spec)
         {
             def->spec = spec;

@@ -697,8 +697,30 @@ IEC61850Client::handleAllValues ()
                                       ? IEC61850_FC_MX
                                       : IEC61850_FC_ST;
 
-        m_handleMonitoringData (def->objRef, datapoints, def->label, typeId,
-                                nullptr, "", fc, 0);
+        /* def->objRef includes the DA suffix (e.g. "...Ind001.stVal"), but
+         * a fresh read (mmsVal == nullptr, below) must be done at the DO
+         * level to get the struct containing stVal/q/t that def->spec
+         * (fetched at the DO level in m_setVarSpecs) describes - and the
+         * DA name has to be passed separately as `attribute` so
+         * MmsValue_getSubElement can find it, instead of the empty string
+         * this used to pass (which never matches the CDC-specific
+         * elementName, so every polled point always failed as
+         * "No stVal/mag found"). */
+        std::string doRef = def->objRef;
+        std::string attribute;
+        size_t firstDot = doRef.find ('.');
+        if (firstDot != std::string::npos)
+        {
+            size_t secondDot = doRef.find ('.', firstDot + 1);
+            if (secondDot != std::string::npos)
+            {
+                attribute = doRef.substr (secondDot + 1);
+                doRef.erase (secondDot);
+            }
+        }
+
+        m_handleMonitoringData (doRef, datapoints, def->label, typeId,
+                                nullptr, attribute, fc, 0);
     }
     sendData (datapoints, labels);
 }
@@ -761,9 +783,18 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
 
     m_handleMonitoringData (def->objRef, datapoints, def->label, typeId,
                             mmsValue, extracted, fcValue, timestamp);
-    Iec61850Utility::log_debug ("Send %s",
-                                datapoints[0]->toJSONProperty ().c_str ());
-    sendData (datapoints, labels);
+
+    /* datapoints stays empty when value-processing fails (e.g. the DA
+     * named by `attribute` isn't found in the struct read back) -
+     * datapoints[0] here was an unconditional out-of-bounds access on
+     * that empty vector, segfaulting instead of just skipping this
+     * report entry. */
+    if (!datapoints.empty ())
+    {
+        Iec61850Utility::log_debug ("Send %s",
+                                    datapoints[0]->toJSONProperty ().c_str ());
+        sendData (datapoints, labels);
+    }
 }
 
 void
@@ -990,11 +1021,26 @@ IEC61850Client::processAnalogType (
 {
     MmsValue* element
         = MmsValue_getSubElement (mmsvalue, varSpec, (char*)elementName);
+    bool elementIsLeafValue = false;
     if (!element)
     {
+        /* `attribute` can be a compound path like "mag.f" when the
+         * dataset's FCDA points directly at that leaf (daName="mag.f",
+         * not just "mag") - in that case the report delivers the raw
+         * scalar value already, not a struct containing "mag", so
+         * MmsValue_getSubElement above never finds it. The old exact
+         * "attribute == elementName" check only covered the single-level
+         * case (e.g. "stVal"); extend it to also accept elementName as a
+         * *prefix* of a deeper attribute path. */
+        std::string prefix = std::string (elementName) + ".";
         if (attribute == elementName)
         {
             element = mmsvalue;
+        }
+        else if (attribute.rfind (prefix, 0) == 0)
+        {
+            element = mmsvalue;
+            elementIsLeafValue = true;
         }
         else
         {
@@ -1005,6 +1051,20 @@ IEC61850Client::processAnalogType (
     }
 
     auto def = m_config->getExchangeDefinitionByObjRef (objRef);
+
+    if (elementIsLeafValue)
+    {
+        /* mmsvalue IS the final scalar already (e.g. the plain float
+         * behind "mag.f") - there is no further struct to navigate. */
+        double value = MmsValue_toFloat (element);
+        def->lastValue.floatVal = value;
+        def->valueSet = true;
+
+        datapoints.push_back (
+            m_createDatapoint (label, objRef, value, quality, timestamp, true));
+        return true;
+    }
+
     varSpec = MmsVariableSpecification_getChildSpecificationByName (
         varSpec, elementName, nullptr);
     MmsValue* f = MmsValue_getSubElement (element, varSpec, (char*)"f");

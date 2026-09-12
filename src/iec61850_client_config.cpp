@@ -806,6 +806,32 @@ IEC61850ClientConfig::importExchangeConfig (const std::string& exchangeConfig)
             m_exchangeDefinitionsPivotId.insert ({ pivot_id, def });
             m_exchangeDefinitionsObjRef.insert ({ objRef, def });
             m_polledDatapoints.insert ({ objRef, def });
+
+            /* Report processing (handleValue) truncates the incoming
+             * reference to the DO level (e.g. "IED/LN.DO") before looking
+             * it up here, but objRef as configured normally includes the
+             * DA suffix (e.g. "IED/LN.DO.DA"). Without this alias, that
+             * lookup always misses and every report silently gets
+             * dropped ("No exchange definition found"). Index the same
+             * definition under its DO-level truncation too so both the
+             * config-style full reference and the runtime DO-level
+             * reference resolve to it. */
+            {
+                size_t firstDot = objRef.find ('.');
+                if (firstDot != std::string::npos)
+                {
+                    size_t secondDot = objRef.find ('.', firstDot + 1);
+                    if (secondDot != std::string::npos)
+                    {
+                        std::string doRef = objRef.substr (0, secondDot);
+                        if (m_exchangeDefinitionsObjRef.find (doRef)
+                            == m_exchangeDefinitionsObjRef.end ())
+                        {
+                            m_exchangeDefinitionsObjRef.insert ({ doRef, def });
+                        }
+                    }
+                }
+            }
         }
     }
 }
