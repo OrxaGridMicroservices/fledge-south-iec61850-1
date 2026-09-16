@@ -770,6 +770,20 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
     fcString
         = objRef.substr (bracketPos + 1, objRef.find (']') - bracketPos - 1);
     fcValue = stringToFunctionalConstraint (fcString);
+
+    /* Look up by the FULL DA-suffixed reference first. importExchangeConfig
+     * keys m_exchangeDefinitionsObjRef by this full reference uniquely per
+     * configured DA, so this correctly distinguishes multiple DAs configured
+     * under the same DO (e.g. an ACT/ACD "Op" DO with separate general/
+     * phsA/phsB/phsC points, each its own DataExchangeDefinition). Only a
+     * genuinely DO-level-only dataset entry (single dot, no DA component at
+     * all) needs the DO-level alias fallback below - using that alias
+     * unconditionally would collapse every DA under a shared DO onto
+     * whichever one happened to register the alias first. */
+    std::string fullObjRef = objRef.substr (0, bracketPos);
+    std::shared_ptr<DataExchangeDefinition> def
+        = m_config->getExchangeDefinitionByObjRef (fullObjRef);
+
     if (secondDotPos != std::string::npos)
     {
         objRef.erase (secondDotPos);
@@ -779,8 +793,8 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
         objRef.erase (bracketPos);
     }
 
-    const std::shared_ptr<DataExchangeDefinition> def
-        = m_config->getExchangeDefinitionByObjRef (objRef);
+    if (!def)
+        def = m_config->getExchangeDefinitionByObjRef (objRef);
 
     if (!def)
     {
@@ -794,13 +808,17 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
     labels.push_back (def->label);
 
     /* `extracted` above is derived from the *incoming report's own* FCDA
-     * reference, which for a DO-level dataset entry (e.g. "LD/LN.DO[ST]",
-     * one dot) has no further DA component and comes out empty - even when
-     * def->objRef (the config's own, authoritative reference) names a more
-     * precise attribute, e.g. "LD/LN.DO.general" or "LD/LN.DO.mag.f". Prefer
-     * that when present, using the same DO-level truncation the polling
-     * path (handleAllValues) already applies to def->objRef, so both paths
-     * resolve the same attribute for the same configured point. */
+     * reference and, now that `def` is resolved per-DA above, is already
+     * correct whenever the report entry names a DA at all. Only a DO-level
+     * dataset entry (e.g. "LD/LN.DO[ST]", one dot) has no DA component and
+     * comes out empty - fall back to def->objRef (the config's own,
+     * authoritative reference) for that case only, same DO-level truncation
+     * the polling path (handleAllValues) already applies. Unconditionally
+     * overwriting `extracted` from def->objRef here previously discarded a
+     * correct per-report attribute in favor of whichever DA's definition
+     * happened to win the DO-level alias, breaking every other DA sharing
+     * that DO (e.g. ACT/ACD "Op"'s general/phsA/phsB/phsC all resolving to
+     * one DA's attribute, so only that one ever decoded correctly). */
     std::string doRef = def->objRef;
     std::string attribute = extracted;
     size_t defFirstDot = doRef.find ('.');
@@ -809,7 +827,8 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
         size_t defSecondDot = doRef.find ('.', defFirstDot + 1);
         if (defSecondDot != std::string::npos)
         {
-            attribute = doRef.substr (defSecondDot + 1);
+            if (attribute.empty ())
+                attribute = doRef.substr (defSecondDot + 1);
             doRef.erase (defSecondDot);
         }
     }
@@ -984,7 +1003,19 @@ IEC61850Client::processBooleanType (
         element = MmsValue_getSubElement (mmsvalue, varSpec, (char*)elementName);
     if (!element)
     {
-        if (attribute == elementName)
+        /* A DA-level FCDA (e.g. objRef's own suffix naming "phsA" directly,
+         * not just the DO as a whole) reports back the scalar leaf value
+         * itself, not a struct to extract a sub-element from - varSpec here
+         * still describes the DO-level struct (m_setVarSpecs always fetches
+         * at DO level), so MmsValue_getSubElement() on a non-structured
+         * mmsvalue can never find anything, regardless of which attribute
+         * name was asked for. Previously this bare-mmsvalue case only
+         * kicked in when attribute==elementName (the CDC-generic default,
+         * e.g. plain SPS "stVal"), so any other configured attribute name
+         * on a bare value - e.g. ACD/ACT "general"/"phsA"/"phsB"/"phsC" -
+         * fell through to the error below even though mmsvalue was
+         * perfectly readable as the answer directly. */
+        if (attribute == elementName || MmsValue_getType (mmsvalue) != MMS_STRUCTURE)
         {
             element = mmsvalue;
         }
