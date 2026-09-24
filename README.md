@@ -2,6 +2,22 @@
 
 A simple asynchronous IEC61850 plugin that pulls data from a server and sends it to Fledge.
 
+## OrxaGrid Fork — What's Different From Upstream
+
+This repository is OrxaGrid's fork of [mz-automation/fledge-south-iec61850](https://bitbucket.org/mz-automation/fledge-south-iec61850) (the `fledge-power`/mz-automation south plugin for IEC 61850), maintained here as `fledge-south-iec61850-1` for RDSS, OrxaGrid's SCADA/DMS platform, where it is the south-side integration for IEC 61850 protection relays (GE, ABB, SEL, and others).
+
+Everything below this section is the generic upstream build/usage documentation and is still accurate. On top of upstream, OrxaGrid has fixed around ten real bugs found through live integration testing against real IEDs, not synthetic test models. In short, these fixes cover:
+
+- Multi-DA-per-DO reports (e.g. ACT/ACD `Op`/`Str` with `general`/`phsA`/`phsB`/`phsC`) resolving to the wrong point or failing to decode
+- DO-level dataset entries (no DA suffix) misreading the attribute or crashing the plugin on load
+- Boolean-type (SPS/SPC) decoding that ignored the configured DA name and only matched the CDC-generic `stVal` default
+- DA-suffixed objref reports/polling reading the wrong spec level or attribute, so data was never delivered for that documented config style
+- A null/out-of-bounds crash (segfault) when value processing failed for a dataset member
+- An `out_of_range` crash on DO-level dataset entries with neither a DA suffix nor an `[FC]` bracket, which took down the whole south service before it could connect
+- A polling-cycle bug where one failed point silently shifted every subsequent point's label, so real data streamed in under the wrong asset name
+
+See `git log` for the individual commits and full technical detail on each fix.
+
 To build this plugin, you will need the lib61850 library installed on your environment as described below.
 
 You also need to have Fledge installed from the source code, not from the package repository.
