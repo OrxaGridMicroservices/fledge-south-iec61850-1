@@ -1097,6 +1097,7 @@ IEC61850Client::processAnalogType (
     MmsValue* element
         = MmsValue_getSubElement (mmsvalue, varSpec, (char*)elementName);
     bool elementIsLeafValue = false;
+    std::string elementNameUsed = elementName;
     if (!element)
     {
         /* `attribute` can be a compound path like "mag.f" when the
@@ -1117,7 +1118,28 @@ IEC61850Client::processAnalogType (
             element = mmsvalue;
             elementIsLeafValue = true;
         }
-        else
+        else if (MmsValue_getType (mmsvalue) == MMS_FLOAT
+                 || MmsValue_getType (mmsvalue) == MMS_INTEGER
+                 || MmsValue_getType (mmsvalue) == MMS_UNSIGNED)
+        {
+            /* The report delivered the leaf scalar itself (a DA-level FCDA
+             * such as "MMXU1.TotW.instMag.f[MX]") - same rule as
+             * processBooleanType: a non-structured value can only be the
+             * leaf, whatever attribute name was configured. */
+            element = mmsvalue;
+            elementIsLeafValue = true;
+        }
+        else if (!attribute.empty ())
+        {
+            /* The configured attribute names a different element of the
+             * CDC than the default one - e.g. MV "instMag.f" (GE P14D
+             * FDR1_BCU) instead of "mag.f". Use its first component. */
+            std::string first = attribute.substr (0, attribute.find ('.'));
+            element = MmsValue_getSubElement (mmsvalue, varSpec, (char*)first.c_str ());
+            if (element)
+                elementNameUsed = first;
+        }
+        if (!element)
         {
             Iec61850Utility::log_error ("No %s found %s", elementName,
                                         objRef.c_str ());
@@ -1131,7 +1153,9 @@ IEC61850Client::processAnalogType (
     {
         /* mmsvalue IS the final scalar already (e.g. the plain float
          * behind "mag.f") - there is no further struct to navigate. */
-        double value = MmsValue_toFloat (element);
+        double value = MmsValue_getType (element) == MMS_FLOAT
+                           ? MmsValue_toFloat (element)
+                           : (double) MmsValue_toInt32 (element);
         def->lastValue.floatVal = value;
         def->valueSet = true;
 
@@ -1141,7 +1165,7 @@ IEC61850Client::processAnalogType (
     }
 
     varSpec = MmsVariableSpecification_getChildSpecificationByName (
-        varSpec, elementName, nullptr);
+        varSpec, elementNameUsed.c_str (), nullptr);
     MmsValue* f = MmsValue_getSubElement (element, varSpec, (char*)"f");
 
     if (f)

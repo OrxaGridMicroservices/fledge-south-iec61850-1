@@ -417,12 +417,23 @@ configureRcb (const std::shared_ptr<ReportSubscription>& rs,
 
     if (!rs->datasetRef.empty ())
     {
-        parametersMask |= RCB_ELEMENT_DATSET;
         std::string modifiedDataSetRef = rs->datasetRef;
         std::replace (modifiedDataSetRef.begin (), modifiedDataSetRef.end (),
                       '.', '$');
-        ClientReportControlBlock_setDataSetReference (
-            rcb, modifiedDataSetRef.c_str ());
+        // Write DatSet only when the RCB is not already bound to it. Relays
+        // whose ICD declares ReportSettings datSet="Conf"/"Fix" (e.g. GE
+        // P14D FDR1_BCU) refuse ANY DatSet write - and since all elements go
+        // in one request, that refusal ("access denied") also stops RptEna,
+        // so no report is ever enabled.
+        const char* current = ClientReportControlBlock_getDataSetReference (rcb);
+        std::string cur = current ? current : "";
+        std::replace (cur.begin (), cur.end (), '.', '$');
+        if (cur != modifiedDataSetRef)
+        {
+            parametersMask |= RCB_ELEMENT_DATSET;
+            ClientReportControlBlock_setDataSetReference (
+                rcb, modifiedDataSetRef.c_str ());
+        }
     }
 
     if (rs->gi)
@@ -500,6 +511,19 @@ IEC61850ClientConnection::m_configRcb ()
         IedConnection_setRCBValues (m_connection, &error, rcb, parametersMask,
                                 true);
 
+        if (error == IED_ERROR_ACCESS_DENIED)
+        {
+            // The relay refused one of the optional elements (trigger
+            // options, integrity period, buffer time, DatSet ...). Fall back
+            // to the RCB's own configured settings: reserve + GI + enable.
+            uint32_t minimal = parametersMask & (RCB_ELEMENT_RESV | RCB_ELEMENT_RESV_TMS
+                                                 | RCB_ELEMENT_PURGE_BUF | RCB_ELEMENT_ENTRY_ID
+                                                 | RCB_ELEMENT_GI | RCB_ELEMENT_RPT_ENA);
+            Iec61850Utility::log_warn ("Set RCB Values %s denied (mask 0x%x) - retrying with the RCB's own settings (mask 0x%x)",
+                                       rs->rcbRef.c_str (), parametersMask, minimal);
+            IedConnection_setRCBValues (m_connection, &error, rcb, minimal, true);
+        }
+
         if (clientDataSet)
             ClientDataSet_destroy (clientDataSet);
 
@@ -508,9 +532,12 @@ IEC61850ClientConnection::m_configRcb ()
 
         if (error != IED_ERROR_OK)
         {
-            m_client->logIedClientError (error, "Set RCB Values");
-            return;
+            // name the RCB, and carry on with the others - a single refused
+            // RCB used to `return` here and leave every RCB disabled
+            m_client->logIedClientError (error, "Set RCB Values " + rs->rcbRef);
+            continue;
         }
+        Iec61850Utility::log_info ("RCB %s enabled", rs->rcbRef.c_str ());
     }
 }
 
