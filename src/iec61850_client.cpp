@@ -1218,7 +1218,15 @@ IEC61850Client::processIntegerType (
             return false;
         }
     }
-    long value = MmsValue_toInt32 (element);
+    /* A DPS/DPC stVal (Dbpos) is sent over MMS as a 2-bit BIT STRING
+     * (IEC 61850-8-1), not an INTEGER - MmsValue_toInt32 only decodes
+     * INTEGER/UNSIGNED and returns 0 for a bit-string, so every breaker
+     * position read as 0 (intermediate). Decode it to 0..3
+     * (00 intermediate, 01 off, 10 on, 11 bad). */
+    long value = MmsValue_getType (element) == MMS_BIT_STRING
+                     ? (long) MmsValue_getBitStringAsIntegerBigEndian (
+                         (MmsValue*) element)
+                     : MmsValue_toInt32 (element);
     auto def = m_config->getExchangeDefinitionByObjRef (objRef);
 
     def->lastValue.intVal = (long) value;
