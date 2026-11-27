@@ -628,10 +628,22 @@ IEC61850Client::_monitoringThread ()
                 auto timeout = std::chrono::milliseconds (
                     m_config->backupConnectionTimeout ());
 
+                /* backupConnectionTimeout (default 5 s) is for "nothing is
+                 * happening" only. While the connection is in progress
+                 * (TCP connect, then the post-connect setup that reads the
+                 * variable specs, datasets and RCBs of every point - well
+                 * over 5 s for ~200 points) the connection thread has its own
+                 * timeout and handles failures itself. Disconnecting a
+                 * working connection mid-setup tore it down on every start
+                 * and crashed the south service (local TestIED2, 2026-11-27). */
                 while (!clientConnection->Connected ())
                 {
                     auto now = std::chrono::high_resolution_clock::now ();
-                    if (now - start > timeout)
+                    if (clientConnection->Connecting ())
+                    {
+                        start = now;   // in progress: restart the idle timer
+                    }
+                    else if (now - start > timeout)
                     {
                         clientConnection->Disconnect ();
                         m_active_connection = nullptr;
@@ -794,7 +806,34 @@ IEC61850Client::handleValue (std::string objRef, MmsValue* mmsValue,
     }
 
     if (!def)
+    {
         def = m_config->getExchangeDefinitionByObjRef (objRef);
+        /* The DO-level alias may only serve a member that CONTAINS the
+         * configured point: a DO-level member, or a DA-level member whose
+         * path is a prefix of the configured objRef (e.g. member
+         * "MMXU1.PPV.phsAB", point "MMXU1.PPV.phsAB.cVal.mag.f"). A SIBLING
+         * DA the relay also puts in the dataset but RDSS did not select
+         * (e.g. "PTOV1.Str.dirGeneral" next to the configured
+         * "PTOV1.Str.general") must NOT be routed to that point: its value
+         * (an INTEGER here) was decoded into the BOOLEAN point as a junk
+         * byte (192/64) and raised a DI alarm on every report
+         * (dockerfactory FDR1_BCU, 2026-11-26/27). */
+        if (def && secondDotPos != std::string::npos)
+        {
+            const std::string& cfg = def->objRef;
+            bool contains = cfg == fullObjRef
+                            || (cfg.size () > fullObjRef.size ()
+                                && cfg.compare (0, fullObjRef.size (), fullObjRef) == 0
+                                && cfg[fullObjRef.size ()] == '.');
+            if (!contains)
+            {
+                Iec61850Utility::log_debug (
+                    "Ignoring unselected dataset member %s (not part of %s)",
+                    fullObjRef.c_str (), cfg.c_str ());
+                return;
+            }
+        }
+    }
 
     if (!def)
     {
@@ -981,6 +1020,41 @@ IEC61850Client::cleanUpMmsValue (MmsValue* originalMmsVal,
         MmsValue_delete (usedMmsVal);
 }
 
+/* One decoder for every status point, whatever CDC it was configured with:
+ * the value is taken by the element's real MMS type. The CDC configured in
+ * RDSS (SpsTyp/DpsTyp/...) only chooses the PIVOT shape; it must never decide
+ * HOW the bytes are read. Reading by the configured CDC instead gave junk for
+ * every mismatch: an INTEGER enum (Str.dirNeut, Str.dirGeneral) read as a
+ * boolean became a raw byte 16..224, a Dbpos bit-string read as a boolean
+ * became 2, and the same bit-string read as an integer became 0. */
+bool
+IEC61850Client::m_decodeStatusValue (MmsValue const* element,
+                                     const std::string& objRef, long& value)
+{
+    if (!element)
+        return false;
+    switch (MmsValue_getType (element))
+    {
+    case MMS_BOOLEAN:
+        value = MmsValue_getBoolean (element) ? 1 : 0;
+        return true;
+    case MMS_INTEGER:
+    case MMS_UNSIGNED:
+        value = MmsValue_toInt32 (element);
+        return true;
+    case MMS_BIT_STRING:   // Dbpos: 00 intermediate, 01 off, 10 on, 11 bad
+        value = (long)MmsValue_getBitStringAsIntegerBigEndian (
+            (MmsValue*)element);
+        return true;
+    default:
+        Iec61850Utility::log_warn (
+            "Status value of %s has MMS type %d, not boolean/integer/"
+            "bit-string - skipped",
+            objRef.c_str (), (int)MmsValue_getType (element));
+        return false;
+    }
+}
+
 bool
 IEC61850Client::processBooleanType (
     std::vector<Datapoint*>& datapoints, const std::string& label,
@@ -1026,13 +1100,18 @@ IEC61850Client::processBooleanType (
             return false;
         }
     }
-    bool value = MmsValue_getBoolean (element);
+    /* Decode by the element's REAL MMS type. MmsValue_getBoolean() on a
+     * non-boolean returns a raw byte (an INTEGER enum such as dirNeut came
+     * out as 16..224, a Dbpos bit-string as 2). */
+    long value;
+    if (!m_decodeStatusValue (element, objRef, value))
+        return false;
     auto def = m_config->getExchangeDefinitionByObjRef (objRef);
-    def->lastValue.intVal = (long)value;
+    def->lastValue.intVal = value;
     def->valueSet = true;
 
     datapoints.push_back (
-        m_createDatapoint (label, objRef, (long)value, quality, timestamp, true));
+        m_createDatapoint (label, objRef, value, quality, timestamp, true));
     return true;
 }
 
@@ -1223,10 +1302,9 @@ IEC61850Client::processIntegerType (
      * INTEGER/UNSIGNED and returns 0 for a bit-string, so every breaker
      * position read as 0 (intermediate). Decode it to 0..3
      * (00 intermediate, 01 off, 10 on, 11 bad). */
-    long value = MmsValue_getType (element) == MMS_BIT_STRING
-                     ? (long) MmsValue_getBitStringAsIntegerBigEndian (
-                         (MmsValue*) element)
-                     : MmsValue_toInt32 (element);
+    long value;
+    if (!m_decodeStatusValue (element, objRef, value))
+        return false;
     auto def = m_config->getExchangeDefinitionByObjRef (objRef);
 
     def->lastValue.intVal = (long) value;

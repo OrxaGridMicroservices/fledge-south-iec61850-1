@@ -91,6 +91,7 @@ class IEC61850ClientConnection
     void executePeriodicTasks ();
 
     void cleanUp ();
+    void m_disconnectLocked ();   // Disconnect() body; caller holds m_conLock
 
     IEC61850Client* m_client;
     IEC61850ClientConfig* m_config;

@@ -651,32 +651,16 @@ IEC61850ClientConnection::Start ()
     }
 }
 
+/* The report handlers installed on m_connection get their
+ * m_connDataSetDirectoryPairs entry as parameter and use the exchange
+ * definitions' variable specs. Both used to be freed FIRST, while the
+ * connection - and its receive thread delivering reports - was still alive,
+ * so a report arriving during clean-up ran reportCallbackFunction on freed
+ * memory and crashed the south service (local TestIED2/3, 2026-11-27). They
+ * are now freed only after the connection is destroyed. */
 void
 IEC61850ClientConnection::cleanUp ()
 {
-    if (!m_config->ExchangeDefinition ().empty ())
-    {
-        for (const auto& def : m_config->ExchangeDefinition ())
-        {
-            if (def.second->spec)
-            {
-                MmsVariableSpecification_destroy (def.second->spec);
-                def.second->spec = nullptr;
-            }
-        }
-    }
-
-    if (!m_connDataSetDirectoryPairs.empty ())
-    {
-        for (const auto& entry : m_connDataSetDirectoryPairs)
-        {
-            LinkedList dataSetDirectory = entry->second;
-            LinkedList_destroy (dataSetDirectory);
-            delete entry;
-        }
-        m_connDataSetDirectoryPairs.clear ();
-    }
-
     for(const auto &dataset: m_config->getDatasets()){
         if(dataset.second->dynamic){
             for(const auto &rcb : m_config->getReportSubscriptions()){
@@ -787,6 +771,30 @@ IEC61850ClientConnection::cleanUp ()
         IedConnection_abortAsync (m_connection, &err);
         IedConnection_destroy (m_connection);
         m_connection = nullptr;
+    }
+
+    /* Connection gone: no report callback can run any more. */
+    if (!m_connDataSetDirectoryPairs.empty ())
+    {
+        for (const auto& entry : m_connDataSetDirectoryPairs)
+        {
+            LinkedList dataSetDirectory = entry->second;
+            LinkedList_destroy (dataSetDirectory);
+            delete entry;
+        }
+        m_connDataSetDirectoryPairs.clear ();
+    }
+
+    if (!m_config->ExchangeDefinition ().empty ())
+    {
+        for (const auto& def : m_config->ExchangeDefinition ())
+        {
+            if (def.second->spec)
+            {
+                MmsVariableSpecification_destroy (def.second->spec);
+                def.second->spec = nullptr;
+            }
+        }
     }
 
     if (m_tlsConfig != nullptr)
@@ -1008,8 +1016,25 @@ IEC61850ClientConnection::prepareConnection ()
     return m_connection != nullptr;
 }
 
+/* Disconnect() is called from the outer connection thread
+ * (IEC61850Client::_monitoringThread) when a connect does not complete within
+ * backupConnectionTimeout. It used to run without m_conLock, so it could
+ * destroy m_connection while _conThread was still in its post-connect setup
+ * (m_setVarSpecs / m_configDatasets / m_configRcb, slow with many points):
+ * the setup's MMS reads then failed ("Reading data set directory failed"),
+ * _conThread still marked the connection CONNECTED and the next
+ * IedConnection_getState(nullptr) crashed the south service (seen on local
+ * TestIED2/3 and on 11-26 TestIED3/4/5). Taking the lock makes it wait for
+ * the setup to finish and then clean up safely. */
 void
 IEC61850ClientConnection::Disconnect ()
+{
+    std::lock_guard<std::mutex> lock (m_conLock);
+    m_disconnectLocked ();
+}
+
+void
+IEC61850ClientConnection::m_disconnectLocked ()
 {
     m_connecting = false;
     m_connected = false;
@@ -1204,15 +1229,37 @@ IEC61850ClientConnection::_conThread ()
                     break;
 
                     case CON_STATE_CONNECTING:
-                        newState = IedConnection_getState (m_connection);
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock (m_conLock);
+                            if (m_connection == nullptr)
+                            {
+                                /* Disconnected meanwhile: start over. */
+                                m_connectionState = CON_STATE_IDLE;
+                                break;
+                            }
+                            newState = IedConnection_getState (m_connection);
+                        }
                         if (newState == IED_STATE_CONNECTED)
                         {
                             {
                                 std::lock_guard<std::mutex> lock (m_conLock);
+                                if (m_connection == nullptr || !m_connect)
+                                {
+                                    m_connectionState = CON_STATE_IDLE;
+                                    break;
+                                }
                                 m_setVarSpecs ();
                                 m_initialiseControlObjects ();
                                 m_configDatasets ();
                                 m_configRcb ();
+                                /* Only CONNECTED if the connection still
+                                 * exists and is still wanted. */
+                                if (m_connection == nullptr || !m_connect)
+                                {
+                                    m_connectionState = CON_STATE_IDLE;
+                                    break;
+                                }
                                 Iec61850Utility::log_info (
                                     "Connected to %s:%d", m_serverIp.c_str (),
                                     m_tcpPort);
@@ -1228,12 +1275,18 @@ IEC61850ClientConnection::_conThread ()
                             std::lock_guard<std::mutex> lock (m_conLock);
                             Iec61850Utility::log_warn (
                                 "Timeout while connecting %d", m_tcpPort);
-                            Disconnect ();
+                            m_disconnectLocked ();   // lock already held
                         }
+                    }
                         break;
 
                     case CON_STATE_CONNECTED: {
                         std::lock_guard<std::mutex> lock (m_conLock);
+                        if (m_connection == nullptr)
+                        {
+                            m_connectionState = CON_STATE_IDLE;
+                            break;
+                        }
                         newState = IedConnection_getState (m_connection);
                         if (newState != IED_STATE_CONNECTED)
                         {

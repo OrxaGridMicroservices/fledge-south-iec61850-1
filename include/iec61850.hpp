@@ -206,6 +206,10 @@ class IEC61850Client
                            MmsVariableSpecification* varSpec, Quality quality,
                            uint64_t timestamp, const std::string& attribute);
     void cleanUpMmsValue (MmsValue* originalMmsVal, MmsValue* usedMmsVal);
+    /* Status value from an element by its real MMS type; false (and a
+     * warning) for a type that has no status meaning. */
+    bool m_decodeStatusValue (MmsValue const* element,
+                              const std::string& objRef, long& value);
     bool processBooleanType (std::vector<Datapoint*>& datapoints,
                              const std::string& label,
                              const std::string& objRef, MmsValue* mmsvalue,
